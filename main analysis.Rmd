@@ -1,0 +1,294 @@
+---
+title: " "
+output: html_notebook
+---
+
+# Data import and Data cleaning
+
+This section includes the code for downloading the data & various data 
+cleansing steps: 
+
+- Performed data de-duplication as there were many duplicate records 
+- Filter out all houses with price less than € 7.000 as these are probably typing 
+mistakes (based on various real estate site)
+
+
+```{r}
+library(tidyverse)
+library(DataExplorer)
+library(DT)
+
+# Read dataset
+original_span <- read_csv("https://sg-exercise.s3-eu-west-1.amazonaws.com/assignment_rev2.csv")
+
+# Data cleaning
+span <-
+  original_span %>%
+  distinct(across(c(-id, -agent_id, -ranking_score)), .keep_all = TRUE) %>% # Select unique records
+  mutate(year_of_construction = na_if(year_of_construction, 2155)) %>% # Convert 2155 to missing value
+  filter(price >= 7000) # Filter price based on the minimum house price... 8000 on various Greek websites
+
+```
+
+
+
+# Assignment Part 1
+
+It includes the r code and the table of summarized results. 
+
+```{r}
+
+span %>%
+  group_by(subtype, geography_name) %>%
+  summarise(N = n(), mean_price = round(mean(price), 0), median_price = round(median(price), 0), sd_price = round(sd(price), 0)) %>% 
+  datatable(filter = 'top') %>% 
+  formatCurrency(c('mean_price', 'median_price', 'sd_price'), currency = "€", digits = 0)
+
+```
+
+# Assignment Part 3 
+
+Since the target is to develop a machine learning model we have to take a good look 
+on which features we should use. The following plot shows the proportion of missing
+values per variable
+
+
+```{r fig.width=10}
+
+plot_missing(span, missing_only = TRUE, title = "Missing values % per variable")
+
+```
+
+
+We should definitely exclude **equipped** variable since all values are missing. Also,
+the **id** & **agent_id** were excluded beacause these are not useful in a model. 
+Furthermore since there are a lot of variables with missing values, i decided to
+**exclude all these variables**. In a next step (with more available time) these 
+variables could be included with the appropriate treatment e.g. imputation, encoding.  
+
+```{r}
+# Create the dataset for the modelling phase
+span_model <- 
+  span %>% 
+  select(-equipped, -id, -agent_id) %>% 
+  filter(is.na(year_of_construction) == FALSE & year_of_construction > 1900) %>% 
+  select(ranking_score, geography_name, sq_meters, price, year_of_construction,
+       subtype, rooms, no_of_bathrooms, no_of_wc, ad_type, living_rooms, 
+       kitchens, balcony_area) 
+  
+
+```
+
+
+# _Develop a GBM with grid search
+
+I used the gbm package to develop a gradient boosting machine model. But instead of 
+manually tweaking hyperparameters one at a time, i created a grid search which 
+iterates over every combination of hyperparameter values and develops multiple 
+models (81 in our case) so i can choose the best one.
+
+
+```{r}
+
+library(gbm)
+
+span_model <- 
+  as.data.frame(unclass(span_model), stringsAsFactors = TRUE)
+
+
+# create hyperparameter grid
+hyper_grid <- expand.grid(
+  shrinkage = c(.01, .05, .1),
+  interaction.depth = c(3, 5, 7),
+  n.minobsinnode = c(5, 7, 10),
+  bag.fraction = c(.65, .8, 1), 
+  optimal_trees = 0,               # a place to dump results
+  min_RMSE = 0                     # a place to dump results
+)
+
+
+# randomize data
+random_index <- sample(1:nrow(span_model), nrow(span_model))
+random_span_model <- span_model[random_index, ]
+
+
+# grid search 
+for(i in 1:nrow(hyper_grid)) {
+  
+  # reproducibility
+  set.seed(123)
+  
+  # train model
+  gbm.tune <- gbm(
+    formula = price ~ .,
+    distribution = "gaussian",
+    data = random_span_model,
+    n.trees = 6000,
+    interaction.depth = hyper_grid$interaction.depth[i],
+    shrinkage = hyper_grid$shrinkage[i],
+    n.minobsinnode = hyper_grid$n.minobsinnode[i],
+    bag.fraction = hyper_grid$bag.fraction[i],
+    train.fraction = .75,
+    n.cores = NULL, # will use all cores by default
+    verbose = FALSE
+  )
+  
+  # add min training error and trees to grid
+  hyper_grid$optimal_trees[i] <- which.min(gbm.tune$valid.error)
+  hyper_grid$min_RMSE[i] <- sqrt(min(gbm.tune$valid.error))
+}
+
+
+# save(hyper_grid, file = "./data/hyper_grid.Rda")
+
+hyper_grid %>% 
+  arrange(min_RMSE) %>% 
+  datatable()
+
+
+```
+
+So after selecting the best model (lowest RMSE - € 427,434) i developed the final model 
+using the specified hyperparameters & using 10-fold cross validation. 
+Then we print a feature importance plot. The most important feature seems to be 
+the **size of the property** (square meters). The **construction year** 
+& **number of rooms** are very important. Then **geography_name**, **ranking_score**,
+**subtype** & **number of bathrooms** are somewhat imortant but the rest seems to 
+be unimportant.
+  
+
+```{r}
+
+set.seed(123)
+
+# train GBM model
+gbm.final <- gbm(
+  formula = price ~ .,
+  distribution = "gaussian",
+  data = random_span_model,
+  n.trees = 5732,
+  interaction.depth = 3,
+  shrinkage = 0.1,
+  n.minobsinnode = 7,
+  bag.fraction = .8, 
+  train.fraction = 1,
+  cv.folds = 10,
+  n.cores = NULL, 
+  verbose = FALSE
+  )  
+
+
+vip::vip(gbm.final) +
+  labs(title = "Feature importance plot",
+       subtitle = "Higher importance means more important in prediction model")
+
+
+```
+
+Now let's say we want to predict the value of a new property. After creating the dataset
+by inserting the variables of the property, we run the prediction and it returns 
+a predicted value of € 223,073.9 
+
+
+```{r}
+
+
+new_data <- 
+structure(list(
+    ranking_score = 122, 
+    geography_name = structure(3L, .Label = c("beesy neighborhood", "gentrification area", "northern sub", "south beach"), class = "factor"), 
+    sq_meters = 95, 
+    price = 230000, 
+    year_of_construction = 2007, 
+    subtype = structure(1L, .Label = c("apartment", "apartment complex", "building", "bungalow", "detached", "houseboat", "loft", "maisonette", "other residential", "studio", "villa"), class = "factor"), 
+    rooms = 3, 
+    no_of_bathrooms = 1, 
+    no_of_wc = 1, 
+    ad_type = structure(2L, .Label = c("premium", "simple", "star", "up"), class = "factor"), 
+    living_rooms = 0, 
+    kitchens = 1, 
+    balcony_area = 0), 
+    class = "data.frame", row.names = c(NA, -1L))
+
+
+
+# predict values for test data
+pred_new <- predict(gbm.final, n.trees = gbm.final$n.trees, new_data)
+
+pred_new
+
+```
+
+
+In this case i used the same model for prediction & inference. Ιf there is more
+time, different algorithms could be applied and develop different models e.g Linear
+models for inference.
+
+Of course we need further work to develop a reliable model that predicts
+the house price with better accuracy. I would take the following actions to 
+improve the model:  
+
+- Prepare a better strategy for **feature selection**. I would try various methods
+from intrinsic(e.g. more models), filter(e.g. check statistical significance) & 
+wrapper classes (e.g. backwords/forward elimination) of feature selection.
+- Work a lot in **feature engineering**. E.g summarize categories, encode to nominal 
+in categorical variables. Also try transformations (scaling, smoothing, binning etc.) 
+in numerical predictors & try some 2-way or even 3-way interactions.  
+- Try **more models** with further hyperparameters tuning. e.g. Random Forest, Deep 
+neural networks 
+- Create a shiny application (interactive web dashboards) in order to present the results to the stakeholders. 
+This is a sample of a [forecasting application](https://mantoniou.shinyapps.io/Forecasting/) and a [clustering application](https://mantoniou.shinyapps.io/Clustering/) i have created in the past.
+
+
+
+# Assignment Part 2
+
+A very important metric to show the competitiveness is the price. The following
+table lists some basic price measures per area
+
+```{r}
+
+span %>% 
+  group_by(geography_name) %>% 
+  summarise(N = n(),
+            mean_price = round(mean(price), 0), 
+            sd_price = round(sd(price), 0),
+            min_price = min(price),
+            quantile_25 = quantile(price, probs = .25),
+            median = median(price),
+            quantile = quantile(price, probs = .75),
+            max_price = max(price)
+            ) %>%
+  datatable()
+
+
+
+
+```
+
+
+```{r fig.height=7, fig.width=10}
+library(plotly)
+library(ggthemes)
+library(scales)
+
+
+ggplotly(
+         ggplot(span, aes(price, fill = geography_name)) +
+         geom_density(alpha = 0.5) +
+         scale_x_log10(labels = dollar_format(suffix = "€", prefix = "")) +
+         theme_fivethirtyeight() +
+         scale_fill_tableau() +
+         theme(legend.title = element_blank()) +
+         labs(title = "Property prices distribution per area")
+          )
+
+```
+
+Some next steps would be to discover other measures and check how different these
+are per area. At the end it will be a good idea to develop a single KPI to measure the
+competitiveness of each area. This KPI would combine all significant measures 
+we have discovered. 
+This would definitely need close cooperation with business stakeholders and
+house market experts.
+
