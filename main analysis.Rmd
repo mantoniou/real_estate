@@ -1,8 +1,10 @@
 ---
-title: " "
+title: "SpaN real estate analysis"
 output: html_notebook
 ---
 
+
+--------------------------------------------------------------------------------
 # Data import and Data cleaning
 
 This section includes the code for downloading the data & various data 
@@ -11,6 +13,8 @@ cleansing steps:
 - Performed data de-duplication as there were many duplicate records 
 - Filter out all houses with price less than € 7.000 as these are probably typing 
 mistakes (based on various real estate site)
+
+The original dataset has 15447 records and the cleaned dataset 15353 records.
 
 
 ```{r}
@@ -26,7 +30,10 @@ span <-
   original_span %>%
   distinct(across(c(-id, -agent_id, -ranking_score)), .keep_all = TRUE) %>% # Select unique records
   mutate(year_of_construction = na_if(year_of_construction, 2155)) %>% # Convert 2155 to missing value
-  filter(price >= 7000) # Filter price based on the minimum house price... 8000 on various Greek websites
+  filter(price >= 7000) # Filter price based on the minimum house price
+
+nrow(original_span)
+nrow(span)
 
 ```
 
@@ -65,9 +72,14 @@ the **id** & **agent_id** were excluded beacause these are not useful in a model
 Furthermore since there are a lot of variables with missing values, i decided to
 **exclude all these variables**. In a next step (with more available time) these 
 variables could be included with the appropriate treatment e.g. imputation, encoding.  
+I also deleted all records that the construction year is missing. It is vital in 
+order to include this variable in the model. Also deleted all records that construction 
+year is before 1900 (typing errors). 
+
+The dataset used for the modeling has 14445 records.
 
 ```{r}
-# Create the dataset for the modelling phase
+# Create the dataset for the modeling phase
 span_model <- 
   span %>% 
   select(-equipped, -id, -agent_id) %>% 
@@ -76,11 +88,11 @@ span_model <-
        subtype, rooms, no_of_bathrooms, no_of_wc, ad_type, living_rooms, 
        kitchens, balcony_area) 
   
-
+nrow(span_model)
 ```
 
 
-# _Develop a GBM with grid search
+# _Develop a GBM model with grid search
 
 I used the gbm package to develop a gradient boosting machine model. But instead of 
 manually tweaking hyperparameters one at a time, i created a grid search which 
@@ -256,7 +268,7 @@ span %>%
             min_price = min(price),
             quantile_25 = quantile(price, probs = .25),
             median = median(price),
-            quantile = quantile(price, probs = .75),
+            quantile_75 = quantile(price, probs = .75),
             max_price = max(price)
             ) %>%
   datatable()
